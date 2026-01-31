@@ -513,7 +513,10 @@ class ScribeGenerator
 
                     $content = $response['example'] ?? $response['content'] ?? [];
 
-                    if (! empty($content)) {
+                    // Check if content is a placeholder (e.g., __variable__) instead of real data
+                    $isPlaceholder = is_array($content) && isset($content['__variable__']);
+                    
+                    if (! empty($content) && ! $isPlaceholder) {
                         $json = json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 
                         $lines[] = " * @response {$statusCode}";
@@ -522,7 +525,17 @@ class ScribeGenerator
                             $lines[] = ' * '.$line;
                         }
                     } else {
-                        $lines[] = " * @response {$statusCode}";
+                        // Use model-based example generation for placeholders or empty content
+                        $example = $this->buildDefaultSuccessExample();
+                        if (! empty($example)) {
+                            $json = json_encode($example, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                            $lines[] = " * @response {$statusCode}";
+                            foreach (explode("\n", $json) as $line) {
+                                $lines[] = ' * '.$line;
+                            }
+                        } else {
+                            $lines[] = " * @response {$statusCode}";
+                        }
                     }
                 }
             }
