@@ -83,6 +83,46 @@ class ScribeGenerator
      */
     private function extractFromPhpDoc(string $doc): void
     {
+        // Extract title and description (first non-tag lines after /**)
+        $lines = explode("\n", $doc);
+        $title = null;
+        $description = [];
+        $inDescription = false;
+        
+        foreach ($lines as $line) {
+            $trimmed = trim($line);
+            $trimmed = preg_replace('/^\s*\*\s?/', '', $trimmed);
+            
+            // Skip opening/closing
+            if (str_starts_with($trimmed, '/**') || str_starts_with($trimmed, '*/')) {
+                continue;
+            }
+            
+            // Stop at first tag
+            if (str_starts_with($trimmed, '@')) {
+                break;
+            }
+            
+            // Skip empty lines at the beginning
+            if ($title === null && $trimmed === '') {
+                continue;
+            }
+            
+            if ($title === null) {
+                $title = $trimmed;
+                $inDescription = true;
+            } elseif ($inDescription && $trimmed !== '') {
+                $description[] = $trimmed;
+            }
+        }
+        
+        if ($title) {
+            $this->documentedMetadata['title'] = $title;
+        }
+        if (! empty($description)) {
+            $this->documentedMetadata['description'] = implode(' ', $description);
+        }
+
         // Extract @group
         if (preg_match('/@group\s+(.+)$/m', $doc, $matches)) {
             $this->documentedMetadata['group'] = trim($matches[1]);
@@ -93,45 +133,74 @@ class ScribeGenerator
             $this->documentedMetadata['authenticated'] = true;
         }
 
-        // Extract @bodyParam tags
-        if (preg_match_all('/@bodyParam\s+(\S+)\s+(\S+)/', $doc, $matches, PREG_SET_ORDER)) {
+        // Extract @bodyParam tags with full content
+        // Format: @bodyParam name type required|optional description Example: value
+        if (preg_match_all('/@bodyParam\s+(\S+)\s+(\S+)\s+(required|optional)?\s*([^E]*?)(?:Example:\s*(.+))?$/m', $doc, $matches, PREG_SET_ORDER)) {
             foreach ($matches as $match) {
                 $this->documentedMetadata['body_params'][$match[1]] = [
                     'name' => $match[1],
                     'type' => $match[2],
+                    'required' => ($match[3] ?? 'required') === 'required',
+                    'description' => trim($match[4] ?? ''),
+                    'example' => isset($match[5]) ? trim($match[5]) : null,
                     'source' => 'phpdoc',
+                    'raw' => trim($match[0]),
                 ];
             }
         }
 
-        // Extract @queryParam tags
-        if (preg_match_all('/@queryParam\s+(\S+)\s+(\S+)/', $doc, $matches, PREG_SET_ORDER)) {
+        // Extract @queryParam tags with full content
+        // Format: @queryParam name type required|optional description Example: value
+        if (preg_match_all('/@queryParam\s+(\S+)\s+(\S+)\s+(required|optional)?\s*([^E]*?)(?:Example:\s*(.+))?$/m', $doc, $matches, PREG_SET_ORDER)) {
             foreach ($matches as $match) {
                 $this->documentedMetadata['query_params'][$match[1]] = [
                     'name' => $match[1],
                     'type' => $match[2],
+                    'required' => ($match[3] ?? 'optional') === 'required',
+                    'description' => trim($match[4] ?? ''),
+                    'example' => isset($match[5]) ? trim($match[5]) : null,
                     'source' => 'phpdoc',
+                    'raw' => trim($match[0]),
                 ];
             }
         }
 
-        // Extract @urlParam tags
-        if (preg_match_all('/@urlParam\s+(\S+)\s+(\S+)/', $doc, $matches, PREG_SET_ORDER)) {
+        // Extract @urlParam tags with full content
+        // Format: @urlParam name type required|optional description Example: value
+        if (preg_match_all('/@urlParam\s+(\S+)\s+(\S+)\s+(required|optional)?\s*([^E]*?)(?:Example:\s*(\S+))?$/m', $doc, $matches, PREG_SET_ORDER)) {
             foreach ($matches as $match) {
                 $this->documentedMetadata['url_params'][$match[1]] = [
                     'name' => $match[1],
                     'type' => $match[2],
+                    'required' => ($match[3] ?? 'required') === 'required',
+                    'description' => trim($match[4] ?? ''),
+                    'example' => $match[5] ?? null,
                     'source' => 'phpdoc',
+                    'raw' => trim($match[0]),
                 ];
             }
         }
 
-        // Extract @response tags with status codes
-        if (preg_match_all('/@response\s+(\d+)/', $doc, $matches)) {
-            foreach ($matches[1] as $status) {
-                $this->documentedMetadata['responses'][(int) $status] = [
-                    'status' => (int) $status,
+        // Extract @response tags with status codes AND their content
+        // Match @response followed by status code and optionally type and JSON content
+        if (preg_match_all('/@response\s+(\d+)\s*(\w+)?\s*([\s\S]*?)(?=@\w|$)/m', $doc, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $status = (int) $match[1];
+                $type = ! empty($match[2]) ? trim($match[2]) : null;
+                $content = ! empty($match[3]) ? trim($match[3]) : null;
+                
+                // Clean up the content (remove leading * from multi-line)
+                if ($content) {
+                    $content = preg_replace('/^\s*\*\s?/m', '', $content);
+                    $content = trim($content);
+                }
+                
+                $this->documentedMetadata['responses'][$status] = [
+                    'status' => $status,
+                    'type' => $type,
+                    'content' => $content,
                     'source' => 'phpdoc',
+                    'raw' => $match[0],
                 ];
             }
         }
@@ -399,11 +468,35 @@ class ScribeGenerator
 
     private function addBodyParameters(array &$lines): void
     {
+        $addedParams = [];
+        
+        // First, re-emit any existing body params from documentedMetadata
+        foreach ($this->documentedMetadata['body_params'] as $name => $paramData) {
+            if (isset($paramData['source']) && $paramData['source'] === 'phpdoc') {
+                $addedParams[$name] = true;
+                
+                // Rebuild the bodyParam tag from captured data
+                $required = ($paramData['required'] ?? true) ? 'required' : 'optional';
+                $type = $paramData['type'] ?? 'string';
+                $description = $paramData['description'] ?? '';
+                $example = $paramData['example'] ?? null;
+                
+                $line = " * @bodyParam {$name} {$type} {$required}";
+                if ($description) {
+                    $line .= ' ' . $description;
+                }
+                if ($example !== null) {
+                    $line .= ' Example: ' . $example;
+                }
+                $lines[] = $line;
+            }
+        }
+        
+        // Then add any new body params from analysis that aren't already documented
         if (isset($this->analysis['body_params']) && ! empty($this->analysis['body_params'])) {
-            $addedParams = false;
             foreach ($this->analysis['body_params'] as $field => $param) {
-                // Skip if already documented via PHPDoc or Attribute (Smart Completion)
-                if ($this->isBodyParamDocumented($field)) {
+                // Skip if already added or documented via PHPDoc or Attribute
+                if (isset($addedParams[$field]) || $this->isBodyParamDocumented($field)) {
                     continue;
                 }
 
@@ -424,90 +517,169 @@ class ScribeGenerator
                     $description,
                     is_array($example) ? json_encode($example) : $example
                 );
-                $addedParams = true;
+                $addedParams[$field] = true;
             }
-            if ($addedParams) {
-                $lines[] = ' *';
-            }
+        }
+        
+        if (! empty($addedParams)) {
+            $lines[] = ' *';
         }
     }
 
     private function addQueryParameters(array &$lines): void
     {
+        $addedParams = [];
+        
+        // First, re-emit any existing query params from documentedMetadata
+        foreach ($this->documentedMetadata['query_params'] as $name => $paramData) {
+            if (isset($paramData['source']) && $paramData['source'] === 'phpdoc') {
+                $addedParams[$name] = true;
+                
+                // Rebuild the queryParam tag from captured data
+                $required = ($paramData['required'] ?? false) ? 'required' : 'optional';
+                $type = $paramData['type'] ?? 'string';
+                $description = $paramData['description'] ?? '';
+                $example = $paramData['example'] ?? null;
+                
+                $line = " * @queryParam {$name} {$type} {$required}";
+                if ($description) {
+                    $line .= ' ' . $description;
+                }
+                if ($example !== null) {
+                    $line .= ' Example: ' . $example;
+                }
+                $lines[] = $line;
+            }
+        }
+        
+        // Then add any new query params from analysis that aren't already documented
         if (isset($this->analysis['query_params']) && ! empty($this->analysis['query_params'])) {
-            $addedParams = false;
             foreach ($this->analysis['query_params'] as $param) {
-                // Skip if already documented via PHPDoc or Attribute (Smart Completion)
-                if ($this->isQueryParamDocumented($param['field'])) {
+                $field = $param['field'];
+                // Skip if already added or documented via PHPDoc or Attribute
+                if (isset($addedParams[$field]) || $this->isQueryParamDocumented($field)) {
                     continue;
                 }
 
                 $required = $param['required'] ? 'required' : 'optional';
-                $example = $param['example'] ?? $this->generateExampleForField($param['field'], $param['type'] ?? 'string');
+                $example = $param['example'] ?? $this->generateExampleForField($field, $param['type'] ?? 'string');
 
                 $lines[] = sprintf(
                     ' * @queryParam %s %s %s %s Example: %s',
-                    $param['field'],
+                    $field,
                     $param['type'] ?? 'string',
                     $required,
-                    $param['description'] ?? Str::title(str_replace('_', ' ', $param['field'])),
+                    $param['description'] ?? Str::title(str_replace('_', ' ', $field)),
                     $example
                 );
-                $addedParams = true;
+                $addedParams[$field] = true;
             }
-            if ($addedParams) {
-                $lines[] = ' *';
-            }
+        }
+        
+        if (! empty($addedParams)) {
+            $lines[] = ' *';
         }
     }
 
     private function addUrlParameters(array &$lines): void
     {
+        $addedParams = [];
+
+        // First, re-emit any existing url params from documentedMetadata
+        foreach ($this->documentedMetadata['url_params'] as $name => $paramData) {
+            if (isset($paramData['source']) && $paramData['source'] === 'phpdoc') {
+                $addedParams[$name] = true;
+                
+                // Rebuild the urlParam tag
+                $required = ($paramData['required'] ?? true) ? 'required' : 'optional';
+                $description = $paramData['description'] ?? 'Resource identifier';
+                $example = $paramData['example'] ?? '1';
+                
+                $lines[] = sprintf(
+                    ' * @urlParam %s %s %s %s Example: %s',
+                    $name,
+                    $paramData['type'] ?? 'integer',
+                    $required,
+                    $description,
+                    $example
+                );
+            }
+        }
+
+        // Then add any new url params from analysis that aren't already documented
         if (isset($this->analysis['url_params']) && ! empty($this->analysis['url_params'])) {
-            $addedParams = false;
             foreach ($this->analysis['url_params'] as $param) {
-                // Skip if already documented via PHPDoc or Attribute (Smart Completion)
-                if ($this->isUrlParamDocumented($param['field'])) {
+                $field = $param['field'];
+                
+                // Skip if already added from existing docs
+                if (isset($addedParams[$field])) {
                     continue;
                 }
 
                 $lines[] = sprintf(
                     ' * @urlParam %s %s required %s Example: %s',
-                    $param['field'],
+                    $field,
                     $param['type'] ?? 'integer',
                     $param['description'] ?? 'Resource identifier',
                     $param['example'] ?? '1'
                 );
-                $addedParams = true;
+                $addedParams[$field] = true;
             }
-            if ($addedParams) {
-                $lines[] = ' *';
-            }
+        }
+
+        if (! empty($addedParams)) {
+            $lines[] = ' *';
         }
     }
 
     private function addSuccessResponses(array &$lines): void
     {
         $hasSuccess = false;
+        $addedStatusCodes = [];
 
+        // First, re-emit any existing success responses from documentedMetadata
+        foreach ($this->documentedMetadata['responses'] as $status => $responseData) {
+            if ($status >= 200 && $status < 300 && isset($responseData['source']) && $responseData['source'] === 'phpdoc') {
+                $hasSuccess = true;
+                $addedStatusCodes[$status] = true;
+                
+                // Rebuild the response tag
+                $type = $responseData['type'] ?? '';
+                $content = $responseData['content'] ?? '';
+                
+                if ($type && $content) {
+                    $lines[] = " * @response {$status} {$type}";
+                    foreach (explode("\n", $content) as $contentLine) {
+                        $lines[] = ' * '.$contentLine;
+                    }
+                } elseif ($content) {
+                    $lines[] = " * @response {$status}";
+                    foreach (explode("\n", $content) as $contentLine) {
+                        $lines[] = ' * '.$contentLine;
+                    }
+                } else {
+                    $lines[] = " * @response {$status}";
+                }
+            }
+        }
+
+        // Then add any new success responses from analysis that aren't already documented
         if (isset($this->analysis['responses']) && is_array($this->analysis['responses'])) {
             foreach ($this->analysis['responses'] as $response) {
-                // Get status from response object, not array key
                 $statusCode = (int) ($response['status'] ?? 0);
 
                 if ($statusCode >= 200 && $statusCode < 300) {
-                    // Skip if already documented via PHPDoc or Attribute (Smart Completion)
-                    if ($this->isResponseDocumented($statusCode)) {
-                        $hasSuccess = true;
+                    // Skip if already added from existing docs
+                    if (isset($addedStatusCodes[$statusCode])) {
                         continue;
                     }
 
                     $hasSuccess = true;
+                    $addedStatusCodes[$statusCode] = true;
 
                     // 204 No Content - just show the status, no body
                     if ($statusCode === 204) {
                         $lines[] = ' * @response 204';
-
                         continue;
                     }
 
@@ -518,10 +690,8 @@ class ScribeGenerator
                     
                     if (! empty($content) && ! $isPlaceholder) {
                         $json = json_encode($content, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-
                         $lines[] = " * @response {$statusCode}";
-                        $jsonLines = explode("\n", $json);
-                        foreach ($jsonLines as $line) {
+                        foreach (explode("\n", $json) as $line) {
                             $lines[] = ' * '.$line;
                         }
                     } else {
@@ -646,12 +816,42 @@ class ScribeGenerator
     {
         $addedResponses = [];
 
-        // First, add error responses from explicit response() calls
+        // First, re-emit any existing error responses from documentedMetadata
+        foreach ($this->documentedMetadata['responses'] as $status => $responseData) {
+            if ($status >= 400 && isset($responseData['source']) && $responseData['source'] === 'phpdoc') {
+                $addedResponses[$status] = true;
+                
+                // Rebuild the response tag
+                $type = $responseData['type'] ?? '';
+                $content = $responseData['content'] ?? '';
+                
+                if ($type && $content) {
+                    $lines[] = " * @response {$status} {$type}";
+                    foreach (explode("\n", $content) as $contentLine) {
+                        $lines[] = ' * '.$contentLine;
+                    }
+                } elseif ($content) {
+                    $lines[] = " * @response {$status}";
+                    foreach (explode("\n", $content) as $contentLine) {
+                        $lines[] = ' * '.$contentLine;
+                    }
+                } else {
+                    $lines[] = " * @response {$status}";
+                }
+            }
+        }
+
+        // Then add error responses from explicit response() calls that aren't already documented
         if (isset($this->analysis['responses']) && is_array($this->analysis['responses'])) {
             foreach ($this->analysis['responses'] as $response) {
                 $statusCode = (int) ($response['status'] ?? 0);
 
                 if ($statusCode >= 400) {
+                    // Skip if already added from existing docs
+                    if (isset($addedResponses[$statusCode])) {
+                        continue;
+                    }
+                    
                     $key = $statusCode.'_'.md5(json_encode($response['content'] ?? ''));
                     if (isset($addedResponses[$key])) {
                         continue;
@@ -682,6 +882,12 @@ class ScribeGenerator
             foreach ($this->analysis['exceptions'] as $exception) {
                 if (isset($exception['status']) && $exception['status'] >= 400) {
                     $status = $exception['status'];
+                    
+                    // Skip if already added
+                    if (isset($addedResponses[$status])) {
+                        continue;
+                    }
+                    
                     $key = $status.'_exception';
                     if (isset($addedResponses[$key])) {
                         continue;
@@ -950,6 +1156,11 @@ class ScribeGenerator
 
     private function generateTitle(): string
     {
+        // Preserve existing title if present
+        if (! empty($this->documentedMetadata['title'])) {
+            return $this->documentedMetadata['title'];
+        }
+        
         $methodName = $this->methodName;
         $titles = [
             'index' => 'List all resources',
@@ -986,6 +1197,11 @@ class ScribeGenerator
 
     private function generateDescription(): string
     {
+        // Preserve existing description if present
+        if (! empty($this->documentedMetadata['description'])) {
+            return $this->documentedMetadata['description'];
+        }
+        
         $description = [];
 
         if (isset($this->analysis['operation_type'])) {
