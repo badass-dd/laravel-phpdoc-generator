@@ -128,6 +128,11 @@ class ScribeGenerator
                 continue;
             }
             
+            // Skip stray slashes (remnants of doc block markers)
+            if ($trimmed === '/' || $trimmed === '*') {
+                continue;
+            }
+            
             // This is a non-tag, non-empty, non-JSON line - it's title or description text
             $nonTagLines[] = $trimmed;
         }
