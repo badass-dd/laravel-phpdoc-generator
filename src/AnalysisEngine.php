@@ -147,6 +147,15 @@ class AnalysisEngine
             // Already tracked correctly
         }
 
+        // Infer operation type from code analysis if not already set
+        // This is more reliable than name-based inference
+        if (! isset($analysis['operation_type']) || $analysis['operation_type'] === null) {
+            $codeBasedType = $this->inferOperationTypeFromCode($analysis);
+            if ($codeBasedType) {
+                $analysis['operation_type'] = $codeBasedType;
+            }
+        }
+
         // Check for responses from ResponseAnalyzer or body.operations.responses
         if (isset($analysis['responses']) || isset($analysis['body']['operations']['responses'])) {
             $analysis = $this->enhanceResponseExamples($analysis);
@@ -442,6 +451,52 @@ class AnalysisEngine
             }
         }
 
+        return null;
+    }
+
+    /**
+     * Infer operation type from actual code analysis (not just method name)
+     * This is more reliable than name-based inference
+     */
+    private function inferOperationTypeFromCode(array $analysis): ?string
+    {
+        $eloquentOps = $analysis['body']['operations']['eloquent_operations'] ?? [];
+        $responses = $analysis['body']['operations']['responses'] ?? [];
+        $bodyParams = $analysis['body_params'] ?? [];
+        
+        // Check for delete operations
+        if (in_array('delete', $eloquentOps)) {
+            return 'destroy';
+        }
+        
+        // Check for 204 No Content response (typically delete)
+        foreach ($responses as $response) {
+            if (isset($response['status']) && $response['status'] === 204) {
+                return 'destroy';
+            }
+        }
+        
+        // Check for create operations
+        if (in_array('create', $eloquentOps)) {
+            return 'store';
+        }
+        
+        // Check for 201 Created response
+        foreach ($responses as $response) {
+            if (isset($response['status']) && $response['status'] === 201) {
+                return 'store';
+            }
+        }
+        
+        // Check for update operations
+        if (in_array('update', $eloquentOps) || in_array('save', $eloquentOps)) {
+            // save() with body params is likely an update
+            if (! empty($bodyParams)) {
+                return 'update';
+            }
+            return 'update';
+        }
+        
         return null;
     }
 

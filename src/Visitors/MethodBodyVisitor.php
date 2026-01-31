@@ -25,6 +25,7 @@ class MethodBodyVisitor extends NodeVisitorAbstract
         'eager_relations' => [],
         'body_params' => [],
         'api_resources' => [],  // Track API Resource usage
+        'eloquent_operations' => [], // Track Eloquent model operations like delete(), save(), update()
     ];
 
     private array $variables = [];
@@ -481,6 +482,18 @@ class MethodBodyVisitor extends NodeVisitorAbstract
             foreach ($relations as $relation) {
                 $this->operations['eager_relations'][] = $relation;
             }
+        } elseif (in_array($methodName, ['delete', 'forceDelete', 'destroy'])) {
+            // Track Eloquent delete operations
+            $this->operations['eloquent_operations'][] = 'delete';
+        } elseif (in_array($methodName, ['save', 'push'])) {
+            // Track Eloquent save operations
+            $this->operations['eloquent_operations'][] = 'save';
+        } elseif (in_array($methodName, ['update', 'updateOrCreate', 'updateOrInsert'])) {
+            // Track Eloquent update operations
+            $this->operations['eloquent_operations'][] = 'update';
+        } elseif (in_array($methodName, ['create', 'insert', 'insertGetId', 'insertOrIgnore', 'firstOrCreate', 'firstOrNew'])) {
+            // Track Eloquent create operations
+            $this->operations['eloquent_operations'][] = 'create';
         }
     }
 
@@ -917,6 +930,23 @@ class MethodBodyVisitor extends NodeVisitorAbstract
 
     private function extractResponseStatus(Expr $expr): ?int
     {
+        // Map of Response class constants to their values
+        $httpStatusConstants = [
+            'HTTP_OK' => 200,
+            'HTTP_CREATED' => 201,
+            'HTTP_ACCEPTED' => 202,
+            'HTTP_NO_CONTENT' => 204,
+            'HTTP_MOVED_PERMANENTLY' => 301,
+            'HTTP_FOUND' => 302,
+            'HTTP_BAD_REQUEST' => 400,
+            'HTTP_UNAUTHORIZED' => 401,
+            'HTTP_FORBIDDEN' => 403,
+            'HTTP_NOT_FOUND' => 404,
+            'HTTP_METHOD_NOT_ALLOWED' => 405,
+            'HTTP_UNPROCESSABLE_ENTITY' => 422,
+            'HTTP_INTERNAL_SERVER_ERROR' => 500,
+        ];
+
         if ($expr instanceof Expr\StaticCall && $expr->class instanceof Node\Name) {
             if ($expr->class->toString() === 'response' && $expr->name instanceof Node\Identifier) {
                 if (isset($expr->args[1])) {
@@ -931,8 +961,37 @@ class MethodBodyVisitor extends NodeVisitorAbstract
         if ($expr instanceof Expr\MethodCall && $expr->name instanceof Node\Identifier) {
             if ($expr->name->toString() === 'json' && isset($expr->args[1])) {
                 $arg = $expr->args[1];
+                // Handle numeric literal: response()->json($data, 204)
                 if ($arg->value instanceof Node\Scalar\LNumber) {
                     return $arg->value->value;
+                }
+                // Handle class constant: response()->json($data, Response::HTTP_NO_CONTENT)
+                if ($arg->value instanceof Expr\ClassConstFetch) {
+                    $constName = $arg->value->name instanceof Node\Identifier 
+                        ? $arg->value->name->toString() 
+                        : null;
+                    if ($constName && isset($httpStatusConstants[$constName])) {
+                        return $httpStatusConstants[$constName];
+                    }
+                }
+            }
+        }
+
+        // Handle FuncCall: response()->json(...) or response(..., 204)
+        if ($expr instanceof Expr\FuncCall && $expr->name instanceof Node\Name) {
+            $funcName = $expr->name->toString();
+            if ($funcName === 'response' && isset($expr->args[1])) {
+                $arg = $expr->args[1];
+                if ($arg->value instanceof Node\Scalar\LNumber) {
+                    return $arg->value->value;
+                }
+                if ($arg->value instanceof Expr\ClassConstFetch) {
+                    $constName = $arg->value->name instanceof Node\Identifier 
+                        ? $arg->value->name->toString() 
+                        : null;
+                    if ($constName && isset($httpStatusConstants[$constName])) {
+                        return $httpStatusConstants[$constName];
+                    }
                 }
             }
         }

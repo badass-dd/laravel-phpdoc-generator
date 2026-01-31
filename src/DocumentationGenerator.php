@@ -97,7 +97,13 @@ class DocumentationGenerator
 
         $methodReflection = $this->reflection->getMethod($methodName);
 
-        if (! $this->shouldAnalyzeMethod($methodReflection)) {
+        // When a specific method is requested, only check basic constraints (public, not constructor)
+        // Skip complexity/resource method checks since user explicitly wants this method
+        if (! $methodReflection->isPublic() || $methodReflection->isConstructor() || $methodReflection->isDestructor()) {
+            return;
+        }
+
+        if (str_starts_with($methodReflection->getName(), '__')) {
             return;
         }
 
