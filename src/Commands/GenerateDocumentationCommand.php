@@ -65,6 +65,11 @@ class GenerateDocumentationCommand extends Command
             $this->config['include_simple_methods'] = true;
         }
 
+        // When a specific method is requested, include all methods to ensure it's analyzed
+        if ($this->option('method')) {
+            $this->config['include_simple_methods'] = true;
+        }
+
         if ($this->option('overwrite')) {
             $this->config['output']['preserve_existing'] = false;
             $this->config['output']['merge_strategy'] = 'overwrite';
