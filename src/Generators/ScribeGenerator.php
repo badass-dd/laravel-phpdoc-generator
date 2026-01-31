@@ -1022,6 +1022,22 @@ class ScribeGenerator
 
     private function addValidationErrorResponse(array &$lines): void
     {
+        // Skip if 422 response already exists in documented metadata
+        if (isset($this->documentedMetadata['responses'][422])) {
+            // Re-emit the existing 422 response
+            $existing = $this->documentedMetadata['responses'][422];
+            $lines[] = ' * @response 422';
+            if (! empty($existing['body'])) {
+                $bodyLines = explode("\n", $existing['body']);
+                foreach ($bodyLines as $bodyLine) {
+                    $lines[] = ' * '.$bodyLine;
+                }
+            }
+            $lines[] = ' *';
+
+            return;
+        }
+
         if (isset($this->analysis['validation_rules']) && ! empty($this->analysis['validation_rules'])) {
             $example = [
                 'message' => 'The given data was invalid.',
