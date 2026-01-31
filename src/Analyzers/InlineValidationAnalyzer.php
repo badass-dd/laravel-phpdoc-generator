@@ -111,11 +111,19 @@ class InlineValidationAnalyzer extends BaseAnalyzer
             if (str_contains($r, 'integer') || str_contains($r, 'numeric')) {
                 return 'integer';
             }
+            // exists:table,column typically refers to an ID (integer)
+            if (str_starts_with($r, 'exists:')) {
+                return 'integer';
+            }
             if (str_contains($r, 'array') || str_contains($r, 'json')) {
                 return 'array';
             }
             if (str_contains($r, 'boolean')) {
                 return 'boolean';
+            }
+            // date/datetime rules
+            if ($r === 'date' || str_starts_with($r, 'date_format:') || str_starts_with($r, 'after:') || str_starts_with($r, 'before:')) {
+                return 'datetime';
             }
         }
 

@@ -1349,6 +1349,11 @@ class ScribeGenerator
             return '[]';
         }
 
+        // If the type is datetime, return a datetime string
+        if ($type === 'datetime') {
+            return $this->faker->dateTime()->format('Y-m-d H:i:s');
+        }
+
         $patterns = [
             '/email/' => fn () => $this->faker->email(),
             '/name/' => fn () => $this->faker->name(),
@@ -1359,7 +1364,8 @@ class ScribeGenerator
             '/city/' => fn () => $this->faker->city(),
             '/zip|postcode|postal_code/' => fn () => $this->faker->postcode(),
             '/country/' => fn () => $this->faker->country(),
-            '/date/' => fn () => $this->faker->date(),
+            // Date patterns - English and Italian
+            '/date|data|datetime|data_ora/' => fn () => $this->faker->dateTime()->format('Y-m-d H:i:s'),
             '/title|subject/' => fn () => $this->faker->sentence(3),
             '/description|bio|about/' => fn () => $this->faker->paragraph(),
             '/content|body|message/' => fn () => $this->faker->paragraphs(2, true),
@@ -1384,6 +1390,8 @@ class ScribeGenerator
                 return (string) $this->faker->randomFloat(2, 1, 100);
             case 'boolean':
                 return $this->faker->boolean() ? 'true' : 'false';
+            case 'datetime':
+                return $this->faker->dateTime()->format('Y-m-d H:i:s');
             case 'array':
                 return '[]';
             case 'object':

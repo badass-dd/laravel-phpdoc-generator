@@ -318,7 +318,8 @@ class FormRequestAnalyzer
             'boolean' => 'boolean',
             'bool' => 'boolean',
             'array' => 'array',
-            'date' => 'string',
+            'date' => 'datetime',
+            'date_format' => 'datetime',
             'email' => 'string',
             'string' => 'string',
             'url' => 'string',
@@ -336,6 +337,11 @@ class FormRequestAnalyzer
                     if ($rule === $pattern || str_starts_with($rule, $pattern.':')) {
                         return $type;
                     }
+                }
+
+                // after: and before: rules imply datetime
+                if (str_starts_with($rule, 'after:') || str_starts_with($rule, 'before:')) {
+                    return 'datetime';
                 }
 
                 if (str_starts_with($rule, 'exists:') || str_starts_with($rule, 'unique:')) {
