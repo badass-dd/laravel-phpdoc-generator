@@ -725,6 +725,32 @@ class ScribeGenerator
     {
         $hasSuccess = false;
         $addedStatusCodes = [];
+        
+        // Check if this is a destroy operation first
+        $operation = $this->analysis['operation_type'] ?? $this->methodName;
+        $isDestroyOperation = $operation === 'destroy' 
+            || Str::contains($this->methodName, ['destroy', 'delete', 'remove']);
+
+        // For destroy operations, always use 204 No Content
+        if ($isDestroyOperation) {
+            // Re-emit any existing non-200 success responses (like 204)
+            foreach ($this->documentedMetadata['responses'] as $status => $responseData) {
+                if ($status >= 200 && $status < 300 && $status !== 200 && isset($responseData['source']) && $responseData['source'] === 'phpdoc') {
+                    $hasSuccess = true;
+                    $addedStatusCodes[$status] = true;
+                    $lines[] = " * @response {$status}";
+                }
+            }
+            
+            // If no 204 was found, add it
+            if (! isset($addedStatusCodes[204])) {
+                $lines[] = ' * @response 204';
+                $hasSuccess = true;
+            }
+            
+            $lines[] = ' *';
+            return;
+        }
 
         // First, re-emit any existing success responses from documentedMetadata
         foreach ($this->documentedMetadata['responses'] as $status => $responseData) {
@@ -801,20 +827,6 @@ class ScribeGenerator
         }
 
         if (! $hasSuccess) {
-            // Check if this is a destroy method
-            $isDestroyOperation = ($this->analysis['operation_type'] ?? '') === 'destroy'
-                || Str::contains($this->methodName, ['destroy', 'delete', 'remove']);
-
-            if ($isDestroyOperation) {
-                // Skip if 204 already documented
-                if (! $this->isResponseDocumented(204)) {
-                    $lines[] = ' * @response 204';
-                }
-                $lines[] = ' *';
-
-                return;
-            }
-
             // Skip default 200 if already documented
             if (! $this->isResponseDocumented(200)) {
                 // No explicit 2xx responses found — generate a sensible default using models or inferred types
