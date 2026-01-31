@@ -84,10 +84,11 @@ class ScribeGenerator
     private function extractFromPhpDoc(string $doc): void
     {
         // Extract title and description
-        // Title is the first non-empty, non-tag line (can appear anywhere)
-        // In Scribe, title can be at the start OR after @group
+        // Title is the first non-empty, non-tag line BEFORE any @response tag with content
+        // In Scribe, title appears at the start or after @group (but before content tags)
         $lines = explode("\n", $doc);
         $nonTagLines = [];
+        $inResponseBlock = false;
         
         foreach ($lines as $line) {
             $trimmed = trim($line);
@@ -98,17 +99,36 @@ class ScribeGenerator
                 continue;
             }
             
-            // Skip tags
+            // Check if this is a @response tag - marks the start of a response block
+            if (str_starts_with($trimmed, '@response')) {
+                $inResponseBlock = true;
+                continue;
+            }
+            
+            // Any other tag resets the response block state
             if (str_starts_with($trimmed, '@')) {
+                $inResponseBlock = false;
                 continue;
             }
             
             // Skip empty lines
             if ($trimmed === '') {
+                // Empty line might end a response block
+                $inResponseBlock = false;
                 continue;
             }
             
-            // This is a non-tag, non-empty line - it's title or description text
+            // If we're in a response block, skip this line (it's JSON content)
+            if ($inResponseBlock) {
+                continue;
+            }
+            
+            // Skip lines that look like JSON (response content)
+            if (str_starts_with($trimmed, '{') || str_starts_with($trimmed, '[') || str_starts_with($trimmed, '"')) {
+                continue;
+            }
+            
+            // This is a non-tag, non-empty, non-JSON line - it's title or description text
             $nonTagLines[] = $trimmed;
         }
         
