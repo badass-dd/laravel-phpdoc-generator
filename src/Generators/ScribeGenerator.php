@@ -490,14 +490,24 @@ class ScribeGenerator
     {
         $hasSuccess = false;
 
+        // DEBUG
+        file_put_contents(base_path('storage/logs/scribe_debug.txt'), "addSuccessResponses called\n", FILE_APPEND);
+        file_put_contents(base_path('storage/logs/scribe_debug.txt'), "responses: " . json_encode($this->analysis['responses'] ?? 'none') . "\n", FILE_APPEND);
+        file_put_contents(base_path('storage/logs/scribe_debug.txt'), "documentedMetadata responses: " . json_encode($this->documentedMetadata['responses'] ?? []) . "\n", FILE_APPEND);
+
         if (isset($this->analysis['responses']) && is_array($this->analysis['responses'])) {
             foreach ($this->analysis['responses'] as $response) {
                 // Get status from response object, not array key
                 $statusCode = (int) ($response['status'] ?? 0);
 
+                file_put_contents(base_path('storage/logs/scribe_debug.txt'), "Checking status: $statusCode\n", FILE_APPEND);
+
                 if ($statusCode >= 200 && $statusCode < 300) {
                     // Skip if already documented via PHPDoc or Attribute (Smart Completion)
-                    if ($this->isResponseDocumented($statusCode)) {
+                    $isDocumented = $this->isResponseDocumented($statusCode);
+                    file_put_contents(base_path('storage/logs/scribe_debug.txt'), "isResponseDocumented($statusCode): " . ($isDocumented ? 'true' : 'false') . "\n", FILE_APPEND);
+                    
+                    if ($isDocumented) {
                         $hasSuccess = true;
                         continue;
                     }
