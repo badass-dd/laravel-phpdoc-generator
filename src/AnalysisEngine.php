@@ -45,9 +45,31 @@ class AnalysisEngine
 
     /**
      * Inherit dynamic_fields from methods called via $this->methodName()
+     * 
+     * @param array $analysis The current method analysis
+     * @param array $allMethods All methods in the controller
+     * @param array $visited Already visited methods to prevent infinite loops
+     * @param int $depth Current recursion depth
+     * @return array Enhanced analysis with inherited dynamic fields
      */
-    private function inheritDynamicFieldsFromCalledMethods(array $analysis, array $allMethods): array
-    {
+    private function inheritDynamicFieldsFromCalledMethods(
+        array $analysis,
+        array $allMethods,
+        array $visited = [],
+        int $depth = 0
+    ): array {
+        // Recursion guard: prevent infinite loops and limit depth
+        $maxDepth = $this->config['max_inheritance_depth'] ?? 3;
+        if ($depth >= $maxDepth) {
+            return $analysis;
+        }
+
+        $currentMethod = $analysis['name'] ?? '';
+        if (in_array($currentMethod, $visited, true)) {
+            return $analysis;
+        }
+        $visited[] = $currentMethod;
+
         $calls = $analysis['body']['calls'] ?? [];
 
         foreach ($calls as $call) {
@@ -55,9 +77,22 @@ class AnalysisEngine
             if (isset($call['type']) && $call['type'] === 'instance' && isset($call['method'])) {
                 $calledMethod = $call['method'];
 
+                // Skip if already visited (prevents circular references)
+                if (in_array($calledMethod, $visited, true)) {
+                    continue;
+                }
+
                 // If we have analysis for this method, get its dynamic_fields
                 if (isset($allMethods[$calledMethod])) {
-                    $calledMethodDynamicFields = $allMethods[$calledMethod]['body']['operations']['dynamic_fields'] ?? [];
+                    // Recursively get dynamic fields from nested calls
+                    $calledMethodAnalysis = $this->inheritDynamicFieldsFromCalledMethods(
+                        $allMethods[$calledMethod],
+                        $allMethods,
+                        $visited,
+                        $depth + 1
+                    );
+
+                    $calledMethodDynamicFields = $calledMethodAnalysis['body']['operations']['dynamic_fields'] ?? [];
 
                     if (! empty($calledMethodDynamicFields)) {
                         // Initialize if not set
@@ -181,20 +216,83 @@ class AnalysisEngine
             return [];
         }
 
+        // Ensure this is an Eloquent model
+        if (! is_subclass_of($modelClass, \Illuminate\Database\Eloquent\Model::class)) {
+            return [];
+        }
+
         try {
             $reflection = new \ReflectionClass($modelClass);
             $model = $reflection->newInstanceWithoutConstructor();
 
+            // Safely get table name with fallback
+            $table = null;
+            try {
+                $table = $model->getTable();
+            } catch (\Exception $e) {
+                $table = Str::snake(Str::pluralStudly(class_basename($modelClass)));
+            }
+
+            // Safely get primary key
+            $primaryKey = 'id';
+            try {
+                $primaryKey = $model->getKeyName();
+            } catch (\Exception $e) {
+                // Use default
+            }
+
+            // Safely get fillable
+            $fillable = [];
+            try {
+                $fillable = $model->getFillable();
+            } catch (\Exception $e) {
+                // Use empty array
+            }
+
+            // Safely get casts
+            $casts = [];
+            try {
+                $casts = $model->getCasts();
+            } catch (\Exception $e) {
+                // Use empty array
+            }
+
+            // Safely get dates
+            $dates = [];
+            try {
+                if (property_exists($model, 'dates')) {
+                    $dates = $model->getDates();
+                }
+            } catch (\Exception $e) {
+                // Use empty array
+            }
+
+            // Safely get hidden
+            $hidden = [];
+            try {
+                $hidden = $model->getHidden();
+            } catch (\Exception $e) {
+                // Use empty array
+            }
+
+            // Safely get appends
+            $appends = [];
+            try {
+                $appends = $model->getAppends();
+            } catch (\Exception $e) {
+                // Use empty array
+            }
+
             $analysis = [
-                'table' => $model->getTable() ?? Str::snake(Str::pluralStudly(class_basename($modelClass))),
-                'primary_key' => $model->getKeyName(),
-                'fillable' => $model->getFillable(),
-                'casts' => $model->getCasts(),
-                'dates' => property_exists($model, 'dates') ? $model->getDates() : [],
-                'hidden' => $model->getHidden(),
-                'appends' => $model->getAppends(),
-                'relations' => $this->analyzeModelRelations($reflection),
-                'columns' => $this->analyzeDatabaseColumns($model),
+                'table' => $table,
+                'primary_key' => $primaryKey,
+                'fillable' => $fillable,
+                'casts' => $casts,
+                'dates' => $dates,
+                'hidden' => $hidden,
+                'appends' => $appends,
+                'relations' => $this->safeAnalyzeModelRelations($reflection),
+                'columns' => $this->safeAnalyzeDatabaseColumns($model),
                 'traits' => $this->analyzeModelTraits($reflection),
             ];
 
@@ -204,74 +302,114 @@ class AnalysisEngine
         }
     }
 
-    private function analyzeModelRelations(\ReflectionClass $reflection): array
+    /**
+     * Safely analyze model relations without causing DB errors
+     */
+    private function safeAnalyzeModelRelations(\ReflectionClass $reflection): array
     {
         $relations = [];
 
-        foreach ($reflection->getMethods() as $method) {
-            if (! $method->isPublic() || $method->getNumberOfRequiredParameters() > 0) {
-                continue;
-            }
+        try {
+            foreach ($reflection->getMethods() as $method) {
+                if (! $method->isPublic() || $method->getNumberOfRequiredParameters() > 0) {
+                    continue;
+                }
 
-            $returnType = $method->getReturnType();
-            if (! $returnType) {
-                continue;
-            }
+                $returnType = $method->getReturnType();
+                if (! $returnType) {
+                    continue;
+                }
 
-            $returnTypeName = $returnType->getName();
+                $returnTypeName = $returnType instanceof \ReflectionNamedType 
+                    ? $returnType->getName() 
+                    : null;
+                    
+                if (! $returnTypeName) {
+                    continue;
+                }
 
-            if (is_subclass_of($returnTypeName, Relation::class) || $returnTypeName === Relation::class) {
-                try {
-                    $model = $reflection->newInstanceWithoutConstructor();
-                    $relation = $method->invoke($model);
+                if (is_subclass_of($returnTypeName, Relation::class) || $returnTypeName === Relation::class) {
+                    try {
+                        $model = $reflection->newInstanceWithoutConstructor();
+                        $relation = $method->invoke($model);
 
-                    if ($relation instanceof Relation) {
-                        $relations[$method->getName()] = [
-                            'type' => get_class($relation),
-                            'related' => get_class($relation->getRelated()),
-                            'foreign_key' => $relation->getForeignKeyName(),
-                            'local_key' => $relation->getLocalKeyName(),
-                            'owner_key' => method_exists($relation, 'getOwnerKeyName') ? $relation->getOwnerKeyName() : null,
-                        ];
+                        if ($relation instanceof Relation) {
+                            $relationData = [
+                                'type' => get_class($relation),
+                                'related' => get_class($relation->getRelated()),
+                            ];
+
+                            // Safely get keys
+                            try {
+                                $relationData['foreign_key'] = $relation->getForeignKeyName();
+                            } catch (\Exception $e) {
+                                $relationData['foreign_key'] = null;
+                            }
+
+                            try {
+                                $relationData['local_key'] = $relation->getLocalKeyName();
+                            } catch (\Exception $e) {
+                                $relationData['local_key'] = null;
+                            }
+
+                            try {
+                                $relationData['owner_key'] = method_exists($relation, 'getOwnerKeyName') 
+                                    ? $relation->getOwnerKeyName() 
+                                    : null;
+                            } catch (\Exception $e) {
+                                $relationData['owner_key'] = null;
+                            }
+
+                            $relations[$method->getName()] = $relationData;
+                        }
+                    } catch (\Exception $e) {
+                        // Skip this relation
                     }
-                } catch (\Exception $e) {
                 }
             }
+        } catch (\Exception $e) {
+            // Return empty relations on failure
         }
 
         return $relations;
     }
 
-    private function analyzeDatabaseColumns($model): array
+    /**
+     * Safely analyze database columns with fallback for unavailable DB
+     */
+    private function safeAnalyzeDatabaseColumns($model): array
     {
         $columns = [];
 
         try {
-            if (method_exists($model, 'getConnection')) {
-                $connection = $model->getConnection();
+            if (! method_exists($model, 'getConnection')) {
+                return $columns;
+            }
 
-                if (method_exists($connection, 'getSchemaBuilder')) {
-                    $schema = $connection->getSchemaBuilder();
-                    $table = $model->getTable();
+            $connection = $model->getConnection();
+            if (! $connection || ! method_exists($connection, 'getSchemaBuilder')) {
+                return $columns;
+            }
 
-                    if ($schema->hasTable($table)) {
-                        $columnList = $schema->getColumnListing($table);
+            $schema = $connection->getSchemaBuilder();
+            $table = $model->getTable();
 
-                        $detailedColumns = [];
-                        foreach ($columnList as $column) {
-                            // Use getColumnType which is available in Laravel 12
-                            $type = $schema->getColumnType($table, $column);
-                            $detailedColumns[$column] = [
-                                'type' => $type,
-                            ];
-                        }
+            if (! $schema->hasTable($table)) {
+                return $columns;
+            }
 
-                        return $detailedColumns;
-                    }
+            $columnList = $schema->getColumnListing($table);
+
+            foreach ($columnList as $column) {
+                try {
+                    $type = $schema->getColumnType($table, $column);
+                    $columns[$column] = ['type' => $type];
+                } catch (\Exception $e) {
+                    $columns[$column] = ['type' => 'string'];
                 }
             }
         } catch (\Exception $e) {
-            // Silently fail - columns will be empty and fillable will be used
+            // Database unavailable - return empty columns
         }
 
         return $columns;
@@ -904,95 +1042,84 @@ class AnalysisEngine
 
     /**
      * Get the related model class from a relationship name
+     * @deprecated Use safeGetRelatedModelClass instead
      */
     private function getRelatedModelClass(string $parentModelClass, string $relation): ?string
     {
-        if (! class_exists($parentModelClass)) {
-            return null;
-        }
-
-        try {
-            $parentInstance = new $parentModelClass;
-            if (method_exists($parentInstance, $relation)) {
-                $relationObj = $parentInstance->$relation();
-                if ($relationObj instanceof \Illuminate\Database\Eloquent\Relations\Relation) {
-                    return get_class($relationObj->getRelated());
-                }
-            }
-        } catch (\Exception $e) {
-            // Ignore exceptions during reflection
-        }
-
-        return null;
+        return $this->safeGetRelatedModelClass($parentModelClass, $relation);
     }
 
     private function generateRelatedInstance(string $relation, ?string $parentModelClass = null, ?array $parentModelInfo = null): array
     {
         $faker = \Faker\Factory::create();
-        $relationLower = strtolower($relation);
 
-        // Try to get the related model class from the parent model's relationships
-        $relatedModelClass = null;
-        if ($parentModelClass && class_exists($parentModelClass)) {
-            try {
-                $parentInstance = new $parentModelClass;
-                if (method_exists($parentInstance, $relation)) {
-                    $relationObj = $parentInstance->$relation();
-                    if ($relationObj instanceof \Illuminate\Database\Eloquent\Relations\Relation) {
-                        $relatedModelClass = get_class($relationObj->getRelated());
-                    }
-                }
-            } catch (\Exception $e) {
-                // Ignore exceptions during reflection
-            }
-        }
+        // Try to get the related model class from the parent model's relationships using safe reflection
+        $relatedModelClass = $this->safeGetRelatedModelClass($parentModelClass, $relation);
 
         // If we found the related model, generate an example from its schema
         if ($relatedModelClass && class_exists($relatedModelClass)) {
-            $relatedModelInfo = $this->analyzeModel($relatedModelClass);
-
-            return $this->generateModelInstance($relatedModelClass, $relatedModelInfo, 1);
+            try {
+                $relatedModelInfo = $this->analyzeModel($relatedModelClass);
+                return $this->generateModelInstance($relatedModelClass, $relatedModelInfo, 1);
+            } catch (\Exception $e) {
+                // Fall through to generic fallback
+            }
         }
 
-        // Fallback to generic examples based on relation name
-        if (str_contains($relationLower, 'user')) {
-            return [
-                'id' => $faker->numberBetween(1, 100),
-                'name' => $faker->name(),
-                'email' => $faker->email(),
-            ];
-        }
-
-        if (str_contains($relationLower, 'answer')) {
-            return [
-                'id' => $faker->numberBetween(1, 100),
-                'questionnaire_id' => $faker->numberBetween(1, 100),
-                'index' => $faker->numberBetween(1, 20),
-                'question' => $faker->word(),
-                'answer_value' => $faker->word(),
-            ];
-        }
-
-        if (str_contains($relationLower, 'product')) {
-            return [
-                'id' => $faker->numberBetween(1, 100),
-                'name' => $faker->word(),
-                'price' => $faker->randomFloat(2, 10, 1000),
-            ];
-        }
-
-        if (str_contains($relationLower, 'order')) {
-            return [
-                'id' => $faker->numberBetween(1, 100),
-                'total' => $faker->randomFloat(2, 50, 5000),
-                'status' => $faker->randomElement(['pending', 'processing', 'completed']),
-            ];
-        }
-
+        // Generic fallback - generate a simple instance with id and common fields
         return [
             'id' => $faker->numberBetween(1, 100),
-            'name' => $faker->word(),
+            'created_at' => $faker->dateTimeBetween('-1 year', 'now')->format('Y-m-d H:i:s'),
+            'updated_at' => $faker->dateTimeBetween('-1 year', 'now')->format('Y-m-d H:i:s'),
         ];
+    }
+
+    /**
+     * Safely get the related model class from a relationship using reflection
+     * Wraps model instantiation and relation calls in try-catch to prevent crashes
+     */
+    private function safeGetRelatedModelClass(?string $parentModelClass, string $relation): ?string
+    {
+        if (! $parentModelClass || ! class_exists($parentModelClass)) {
+            return null;
+        }
+
+        try {
+            // Check if it's an Eloquent model first
+            if (! is_subclass_of($parentModelClass, \Illuminate\Database\Eloquent\Model::class)) {
+                return null;
+            }
+
+            // Use reflection to check if the method exists without instantiation
+            $reflection = new \ReflectionClass($parentModelClass);
+            if (! $reflection->hasMethod($relation)) {
+                return null;
+            }
+
+            // Try to create instance without constructor to avoid DB calls
+            $parentInstance = $reflection->newInstanceWithoutConstructor();
+
+            // Check if the relation method exists and returns a Relation
+            if (method_exists($parentInstance, $relation)) {
+                $relationMethod = $reflection->getMethod($relation);
+
+                // Only proceed if method has no required parameters
+                if ($relationMethod->getNumberOfRequiredParameters() === 0) {
+                    try {
+                        $relationObj = $parentInstance->$relation();
+                        if ($relationObj instanceof \Illuminate\Database\Eloquent\Relations\Relation) {
+                            return get_class($relationObj->getRelated());
+                        }
+                    } catch (\Exception $e) {
+                        // Relation call failed, possibly due to DB unavailability
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            // Reflection or instantiation failed
+        }
+
+        return null;
     }
 
     private function generatePaginatedExample(array $models, array $response): array

@@ -359,14 +359,14 @@ class GenerateDocumentationCommand extends Command
                 continue;
             }
 
-            // Find and remove existing docblock above the method
-            $docStartIndex = $this->findExistingDocStart($lines, $methodLineIndex);
+            // Find existing docblocks and attributes above the method
+            $result = $this->analyzeAboveMethod($lines, $methodLineIndex);
 
-            if ($docStartIndex !== null) {
-                // Remove existing docblock lines
-                $removeCount = $methodLineIndex - $docStartIndex;
-                array_splice($lines, $docStartIndex, $removeCount);
-                $methodLineIndex = $docStartIndex;
+            if ($result['docblocks_start'] !== null) {
+                // Remove all docblocks and attributes from docblocks_start to method
+                $removeCount = $methodLineIndex - $result['docblocks_start'];
+                array_splice($lines, $result['docblocks_start'], $removeCount);
+                $methodLineIndex = $result['docblocks_start'];
             }
 
             // Get indentation from the method line
@@ -379,9 +379,13 @@ class GenerateDocumentationCommand extends Command
             foreach ($docLines as $docLine) {
                 $formattedDocBlock[] = $indent.$docLine;
             }
-            $formattedDocBlock[] = ''; // Empty line before method is optional but clean
 
-            // Insert the new docblock before the method
+            // Add preserved attributes after the docblock
+            foreach ($result['attributes'] as $attr) {
+                $formattedDocBlock[] = $indent.$attr;
+            }
+
+            // Insert the new docblock (and attributes) before the method
             array_splice($lines, $methodLineIndex, 0, $formattedDocBlock);
         }
 
@@ -420,6 +424,82 @@ class GenerateDocumentationCommand extends Command
         return $methodLineIndex;
     }
 
+    /**
+     * Analyze lines above a method to find docblocks and attributes.
+     * Returns the start index of docblocks and a list of preserved attributes.
+     *
+     * @return array{docblocks_start: ?int, attributes: string[]}
+     */
+    private function analyzeAboveMethod(array $lines, int $methodLineIndex): array
+    {
+        $docblocksStart = null;
+        $attributes = [];
+        $inDocblock = false;
+
+        for ($i = $methodLineIndex - 1; $i >= 0; $i--) {
+            $trimmed = trim($lines[$i]);
+
+            if ($trimmed === '') {
+                continue;
+            }
+
+            // Docblock end (scanning upwards, so this is where we enter a docblock)
+            if (str_ends_with($trimmed, '*/')) {
+                $inDocblock = true;
+                $docblocksStart = $i;
+
+                continue;
+            }
+
+            // Inside a docblock
+            if ($inDocblock) {
+                if (str_starts_with($trimmed, '/**')) {
+                    $docblocksStart = $i;
+                    $inDocblock = false;
+
+                    continue;
+                }
+                if (str_starts_with($trimmed, '*')) {
+                    $docblocksStart = $i;
+
+                    continue;
+                }
+            }
+
+            // Docblock start (when not already in docblock)
+            if (str_starts_with($trimmed, '/**')) {
+                $docblocksStart = $i;
+
+                continue;
+            }
+
+            // Docblock content
+            if (str_starts_with($trimmed, '*') || str_ends_with($trimmed, '*/')) {
+                continue;
+            }
+
+            // PHP 8 Attributes - collect them (without indentation, we'll re-add it later)
+            if (str_starts_with($trimmed, '#[')) {
+                array_unshift($attributes, $trimmed);
+                if ($docblocksStart === null) {
+                    $docblocksStart = $i;
+                } else {
+                    $docblocksStart = $i;
+                }
+
+                continue;
+            }
+
+            // Any other non-doc line stops the search
+            break;
+        }
+
+        return [
+            'docblocks_start' => $docblocksStart,
+            'attributes' => $attributes,
+        ];
+    }
+
     private function findExistingDocStart(array $lines, int $methodLineIndex): ?int
     {
         $start = null;
@@ -440,6 +520,11 @@ class GenerateDocumentationCommand extends Command
 
             if (str_starts_with($trimmed, '*') || str_starts_with($trimmed, '*/')) {
                 // part of a docblock - keep scanning upwards
+                continue;
+            }
+
+            // PHP 8 Attributes - skip them and continue looking for docblocks above
+            if (str_starts_with($trimmed, '#[')) {
                 continue;
             }
 

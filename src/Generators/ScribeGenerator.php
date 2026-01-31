@@ -3,6 +3,9 @@
 namespace Badass\LazyDocs\Generators;
 
 use Illuminate\Support\Str;
+use ReflectionAttribute;
+use ReflectionClass;
+use ReflectionMethod;
 
 class ScribeGenerator
 {
@@ -20,6 +23,16 @@ class ScribeGenerator
 
     private ?string $existingGroup = null;
 
+    /**
+     * Metadata map of already documented items from PHPDoc and Attributes
+     */
+    private array $documentedMetadata = [];
+
+    /**
+     * PHP 8 Attributes found on the method
+     */
+    private array $methodAttributes = [];
+
     public function __construct(
         array $analysis,
         string $controllerClass,
@@ -33,6 +46,268 @@ class ScribeGenerator
         $this->config = $config;
         $this->existingDoc = $existingDoc;
         $this->faker = \Faker\Factory::create();
+
+        // Build metadata map from existing PHPDoc and Attributes
+        $this->buildMetadataMap();
+    }
+
+    /**
+     * Build a metadata map of already documented items from both PHPDoc and PHP 8 Attributes.
+     * This enables the "Smart Completion" strategy where user-defined documentation takes priority.
+     */
+    private function buildMetadataMap(): void
+    {
+        $this->documentedMetadata = [
+            'group' => null,
+            'authenticated' => false,
+            'body_params' => [],
+            'query_params' => [],
+            'url_params' => [],
+            'responses' => [],
+            'headers' => [],
+            'description' => null,
+            'title' => null,
+        ];
+
+        // Extract from existing PHPDoc
+        if ($this->existingDoc) {
+            $this->extractFromPhpDoc($this->existingDoc);
+        }
+
+        // Extract from PHP 8 Attributes (takes priority over PHPDoc)
+        $this->extractFromAttributes();
+    }
+
+    /**
+     * Extract documented metadata from existing PHPDoc block
+     */
+    private function extractFromPhpDoc(string $doc): void
+    {
+        // Extract @group
+        if (preg_match('/@group\s+(.+)$/m', $doc, $matches)) {
+            $this->documentedMetadata['group'] = trim($matches[1]);
+        }
+
+        // Extract @authenticated
+        if (preg_match('/@authenticated/', $doc)) {
+            $this->documentedMetadata['authenticated'] = true;
+        }
+
+        // Extract @bodyParam tags
+        if (preg_match_all('/@bodyParam\s+(\S+)\s+(\S+)/', $doc, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $this->documentedMetadata['body_params'][$match[1]] = [
+                    'name' => $match[1],
+                    'type' => $match[2],
+                    'source' => 'phpdoc',
+                ];
+            }
+        }
+
+        // Extract @queryParam tags
+        if (preg_match_all('/@queryParam\s+(\S+)\s+(\S+)/', $doc, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $this->documentedMetadata['query_params'][$match[1]] = [
+                    'name' => $match[1],
+                    'type' => $match[2],
+                    'source' => 'phpdoc',
+                ];
+            }
+        }
+
+        // Extract @urlParam tags
+        if (preg_match_all('/@urlParam\s+(\S+)\s+(\S+)/', $doc, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $this->documentedMetadata['url_params'][$match[1]] = [
+                    'name' => $match[1],
+                    'type' => $match[2],
+                    'source' => 'phpdoc',
+                ];
+            }
+        }
+
+        // Extract @response tags with status codes
+        if (preg_match_all('/@response\s+(\d+)/', $doc, $matches)) {
+            foreach ($matches[1] as $status) {
+                $this->documentedMetadata['responses'][(int) $status] = [
+                    'status' => (int) $status,
+                    'source' => 'phpdoc',
+                ];
+            }
+        }
+
+        // Extract @header tags
+        if (preg_match_all('/@header\s+(\S+)/', $doc, $matches)) {
+            foreach ($matches[1] as $header) {
+                $this->documentedMetadata['headers'][$header] = [
+                    'name' => $header,
+                    'source' => 'phpdoc',
+                ];
+            }
+        }
+    }
+
+    /**
+     * Extract documented metadata from PHP 8 Attributes
+     * Attributes take priority over PHPDoc tags
+     */
+    private function extractFromAttributes(): void
+    {
+        if (! class_exists($this->controllerClass)) {
+            return;
+        }
+
+        try {
+            $reflection = new ReflectionClass($this->controllerClass);
+
+            if (! $reflection->hasMethod($this->methodName)) {
+                return;
+            }
+
+            $method = $reflection->getMethod($this->methodName);
+            $attributes = $method->getAttributes();
+
+            foreach ($attributes as $attribute) {
+                $this->processAttribute($attribute);
+            }
+
+            $this->methodAttributes = $attributes;
+        } catch (\Exception $e) {
+            // Silently fail if reflection fails
+        }
+    }
+
+    /**
+     * Process a single PHP 8 Attribute and update the metadata map
+     */
+    private function processAttribute(ReflectionAttribute $attribute): void
+    {
+        $attributeName = $attribute->getName();
+        $shortName = class_basename($attributeName);
+
+        try {
+            $args = $attribute->getArguments();
+        } catch (\Exception $e) {
+            $args = [];
+        }
+
+        // Handle common Scribe attributes
+        switch ($shortName) {
+            case 'Group':
+                $this->documentedMetadata['group'] = $args[0] ?? $args['name'] ?? null;
+                break;
+
+            case 'Authenticated':
+                $this->documentedMetadata['authenticated'] = true;
+                break;
+
+            case 'Unauthenticated':
+                $this->documentedMetadata['authenticated'] = false;
+                break;
+
+            case 'BodyParam':
+                $name = $args['name'] ?? $args[0] ?? null;
+                if ($name) {
+                    $this->documentedMetadata['body_params'][$name] = [
+                        'name' => $name,
+                        'type' => $args['type'] ?? $args[1] ?? 'string',
+                        'source' => 'attribute',
+                    ];
+                }
+                break;
+
+            case 'QueryParam':
+                $name = $args['name'] ?? $args[0] ?? null;
+                if ($name) {
+                    $this->documentedMetadata['query_params'][$name] = [
+                        'name' => $name,
+                        'type' => $args['type'] ?? $args[1] ?? 'string',
+                        'source' => 'attribute',
+                    ];
+                }
+                break;
+
+            case 'UrlParam':
+                $name = $args['name'] ?? $args[0] ?? null;
+                if ($name) {
+                    $this->documentedMetadata['url_params'][$name] = [
+                        'name' => $name,
+                        'type' => $args['type'] ?? $args[1] ?? 'string',
+                        'source' => 'attribute',
+                    ];
+                }
+                break;
+
+            case 'Response':
+            case 'ResponseFromFile':
+            case 'ResponseFromApiResource':
+                $status = $args['status'] ?? $args[0] ?? 200;
+                $this->documentedMetadata['responses'][(int) $status] = [
+                    'status' => (int) $status,
+                    'source' => 'attribute',
+                    'attribute' => $shortName,
+                ];
+                break;
+
+            case 'Header':
+                $name = $args['name'] ?? $args[0] ?? null;
+                if ($name) {
+                    $this->documentedMetadata['headers'][$name] = [
+                        'name' => $name,
+                        'source' => 'attribute',
+                    ];
+                }
+                break;
+        }
+    }
+
+    /**
+     * Check if a body param is already documented (via PHPDoc or Attribute)
+     */
+    private function isBodyParamDocumented(string $paramName): bool
+    {
+        return isset($this->documentedMetadata['body_params'][$paramName]);
+    }
+
+    /**
+     * Check if a query param is already documented (via PHPDoc or Attribute)
+     */
+    private function isQueryParamDocumented(string $paramName): bool
+    {
+        return isset($this->documentedMetadata['query_params'][$paramName]);
+    }
+
+    /**
+     * Check if a URL param is already documented (via PHPDoc or Attribute)
+     */
+    private function isUrlParamDocumented(string $paramName): bool
+    {
+        return isset($this->documentedMetadata['url_params'][$paramName]);
+    }
+
+    /**
+     * Check if a response status is already documented (via PHPDoc or Attribute)
+     */
+    private function isResponseDocumented(int $status): bool
+    {
+        return isset($this->documentedMetadata['responses'][$status]);
+    }
+
+    /**
+     * Check if group is already documented
+     */
+    private function isGroupDocumented(): bool
+    {
+        return $this->documentedMetadata['group'] !== null;
+    }
+
+    /**
+     * Check if authentication is already documented
+     */
+    private function isAuthenticationDocumented(): bool
+    {
+        return $this->documentedMetadata['authenticated'] !== false 
+            || ! empty($this->documentedMetadata['headers']['Authorization']);
     }
 
     public function generate(): string
@@ -67,7 +342,8 @@ class ScribeGenerator
 
         $lines[] = ' */';
 
-        return implode("\n", $lines);
+        // Clean output: remove redundant empty lines for Scribe compatibility
+        return $this->cleanDocBlock(implode("\n", $lines));
     }
 
     private function addTitleAndDescription(array &$lines): void
@@ -124,7 +400,13 @@ class ScribeGenerator
     private function addBodyParameters(array &$lines): void
     {
         if (isset($this->analysis['body_params']) && ! empty($this->analysis['body_params'])) {
+            $addedParams = false;
             foreach ($this->analysis['body_params'] as $field => $param) {
+                // Skip if already documented via PHPDoc or Attribute (Smart Completion)
+                if ($this->isBodyParamDocumented($field)) {
+                    continue;
+                }
+
                 $required = $param['required'] ? 'required' : 'optional';
                 $example = $param['example'] ?? $this->generateExampleForField($field, $param['type'] ?? 'string');
                 $description = $param['description'] ?? Str::title(str_replace('_', ' ', $field));
@@ -142,15 +424,24 @@ class ScribeGenerator
                     $description,
                     is_array($example) ? json_encode($example) : $example
                 );
+                $addedParams = true;
             }
-            $lines[] = ' *';
+            if ($addedParams) {
+                $lines[] = ' *';
+            }
         }
     }
 
     private function addQueryParameters(array &$lines): void
     {
         if (isset($this->analysis['query_params']) && ! empty($this->analysis['query_params'])) {
+            $addedParams = false;
             foreach ($this->analysis['query_params'] as $param) {
+                // Skip if already documented via PHPDoc or Attribute (Smart Completion)
+                if ($this->isQueryParamDocumented($param['field'])) {
+                    continue;
+                }
+
                 $required = $param['required'] ? 'required' : 'optional';
                 $example = $param['example'] ?? $this->generateExampleForField($param['field'], $param['type'] ?? 'string');
 
@@ -162,15 +453,24 @@ class ScribeGenerator
                     $param['description'] ?? Str::title(str_replace('_', ' ', $param['field'])),
                     $example
                 );
+                $addedParams = true;
             }
-            $lines[] = ' *';
+            if ($addedParams) {
+                $lines[] = ' *';
+            }
         }
     }
 
     private function addUrlParameters(array &$lines): void
     {
         if (isset($this->analysis['url_params']) && ! empty($this->analysis['url_params'])) {
+            $addedParams = false;
             foreach ($this->analysis['url_params'] as $param) {
+                // Skip if already documented via PHPDoc or Attribute (Smart Completion)
+                if ($this->isUrlParamDocumented($param['field'])) {
+                    continue;
+                }
+
                 $lines[] = sprintf(
                     ' * @urlParam %s %s required %s Example: %s',
                     $param['field'],
@@ -178,8 +478,11 @@ class ScribeGenerator
                     $param['description'] ?? 'Resource identifier',
                     $param['example'] ?? '1'
                 );
+                $addedParams = true;
             }
-            $lines[] = ' *';
+            if ($addedParams) {
+                $lines[] = ' *';
+            }
         }
     }
 
@@ -193,6 +496,12 @@ class ScribeGenerator
                 $statusCode = (int) ($response['status'] ?? 0);
 
                 if ($statusCode >= 200 && $statusCode < 300) {
+                    // Skip if already documented via PHPDoc or Attribute (Smart Completion)
+                    if ($this->isResponseDocumented($statusCode)) {
+                        $hasSuccess = true;
+                        continue;
+                    }
+
                     $hasSuccess = true;
 
                     // 204 No Content - just show the status, no body
@@ -225,22 +534,28 @@ class ScribeGenerator
                 || Str::contains($this->methodName, ['destroy', 'delete', 'remove']);
 
             if ($isDestroyOperation) {
-                $lines[] = ' * @response 204';
+                // Skip if 204 already documented
+                if (! $this->isResponseDocumented(204)) {
+                    $lines[] = ' * @response 204';
+                }
                 $lines[] = ' *';
 
                 return;
             }
 
-            // No explicit 2xx responses found — generate a sensible default using models or inferred types
-            $example = $this->buildDefaultSuccessExample();
+            // Skip default 200 if already documented
+            if (! $this->isResponseDocumented(200)) {
+                // No explicit 2xx responses found — generate a sensible default using models or inferred types
+                $example = $this->buildDefaultSuccessExample();
 
-            if (! empty($example)) {
-                $json = json_encode($example, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-                $lines[] = ' * @response 200';
-                foreach (explode("\n", $json) as $line) {
-                    $lines[] = ' * '.$line;
+                if (! empty($example)) {
+                    $json = json_encode($example, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                    $lines[] = ' * @response 200';
+                    foreach (explode("\n", $json) as $line) {
+                        $lines[] = ' * '.$line;
+                    }
+                    $lines[] = ' *';
                 }
-                $lines[] = ' *';
             }
         } else {
             $lines[] = ' *';
@@ -522,19 +837,30 @@ class ScribeGenerator
             $requiresAuth = true;
         }
 
+        // Skip if already documented via PHPDoc or Attribute (Smart Completion)
+        if ($this->documentedMetadata['authenticated'] === true) {
+            return;
+        }
+
         if ($requiresAuth) {
             $lines[] = ' * @authenticated';
-            if ($guard) {
-                $lines[] = ' * @header Authorization Bearer {token} (Guard: '.$guard.')';
-            } else {
-                $lines[] = ' * @header Authorization Bearer {token}';
+            // Skip Authorization header if already documented
+            if (! isset($this->documentedMetadata['headers']['Authorization'])) {
+                if ($guard) {
+                    $lines[] = ' * @header Authorization Bearer {token} (Guard: '.$guard.')';
+                } else {
+                    $lines[] = ' * @header Authorization Bearer {token}';
+                }
             }
         }
     }
 
     private function addGroupTag(array &$lines): void
     {
-        $groupName = $this->existingGroup ?? $this->generateGroupName();
+        // Use existing group from PHPDoc, Attribute, or generate new one (priority order)
+        $groupName = $this->documentedMetadata['group'] 
+            ?? $this->existingGroup 
+            ?? $this->generateGroupName();
         $lines[] = " * @group {$groupName}";
     }
 
@@ -872,5 +1198,41 @@ class ScribeGenerator
                 }
             }
         }
+    }
+
+    /**
+     * Clean the DocBlock output to ensure Scribe compatibility
+     * - Removes double empty lines
+     * - Ensures proper spacing between sections
+     * - Formats for consistent output
+     */
+    private function cleanDocBlock(string $docBlock): string
+    {
+        $lines = explode("\n", $docBlock);
+        $cleaned = [];
+        $previousWasEmpty = false;
+
+        foreach ($lines as $line) {
+            $trimmed = trim($line);
+
+            // Check if this is an empty doc line (just " *")
+            $isEmptyLine = $trimmed === '*';
+
+            // Skip if this is a consecutive empty line
+            if ($isEmptyLine && $previousWasEmpty) {
+                continue;
+            }
+
+            $cleaned[] = $line;
+            $previousWasEmpty = $isEmptyLine;
+        }
+
+        // Remove trailing empty line before closing */
+        $count = count($cleaned);
+        if ($count >= 2 && trim($cleaned[$count - 2]) === '*') {
+            array_splice($cleaned, $count - 2, 1);
+        }
+
+        return implode("\n", $cleaned);
     }
 }

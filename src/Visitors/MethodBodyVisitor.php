@@ -5,7 +5,11 @@ namespace Badass\LazyDocs\Visitors;
 use PhpParser\Node;
 use PhpParser\Node\Expr;
 use PhpParser\Node\Stmt;
+use PhpParser\NodeFinder;
+use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
+use PhpParser\ParserFactory;
+use ReflectionClass;
 
 class MethodBodyVisitor extends NodeVisitorAbstract
 {
@@ -20,6 +24,7 @@ class MethodBodyVisitor extends NodeVisitorAbstract
         'middleware' => [],
         'eager_relations' => [],
         'body_params' => [],
+        'api_resources' => [],  // Track API Resource usage
     ];
 
     private array $variables = [];
@@ -31,6 +36,11 @@ class MethodBodyVisitor extends NodeVisitorAbstract
     private array $loops = [];
 
     private array $config;
+
+    /**
+     * Cache for parsed API Resource structures
+     */
+    private static array $resourceCache = [];
 
     public function __construct(array $config)
     {
@@ -55,8 +65,9 @@ class MethodBodyVisitor extends NodeVisitorAbstract
             $this->analyzeReturn($node);
         }
 
-        if ($node instanceof Stmt\Throw_) {
-            $this->analyzeThrow($node);
+        // Handle throw statements (PHP-Parser compatibility)
+        if ($node instanceof Stmt\Expression && $node->expr instanceof Expr\Throw_) {
+            $this->analyzeThrowExpression($node->expr);
         }
 
         return null;
@@ -78,6 +89,11 @@ class MethodBodyVisitor extends NodeVisitorAbstract
 
         if ($expr instanceof Expr\Assign) {
             $this->analyzeAssignment($expr);
+        }
+
+        // Detect API Resource instantiation (new UserResource(...))
+        if ($expr instanceof Expr\New_) {
+            $this->analyzeNewExpression($expr);
         }
     }
 
@@ -123,6 +139,315 @@ class MethodBodyVisitor extends NodeVisitorAbstract
                 $this->operations['eager_relations'][] = $relation;
             }
         }
+
+        // Detect API Resource static calls like UserResource::collection($users)
+        if ($methodName === 'collection' && $this->isApiResourceClass($className)) {
+            $resourceInfo = $this->parseApiResourceClass($className);
+            if ($resourceInfo) {
+                $resourceInfo['is_collection'] = true;
+                $this->operations['api_resources'][] = $resourceInfo;
+            }
+        }
+    }
+
+    /**
+     * Analyze new expressions to detect API Resource instantiation
+     */
+    private function analyzeNewExpression(Expr\New_ $new): void
+    {
+        if (! $new->class instanceof Node\Name) {
+            return;
+        }
+
+        $className = $new->class->toString();
+
+        // Check if this is an API Resource class
+        if ($this->isApiResourceClass($className)) {
+            $resourceInfo = $this->parseApiResourceClass($className);
+            if ($resourceInfo) {
+                $resourceInfo['is_collection'] = false;
+                $this->operations['api_resources'][] = $resourceInfo;
+            }
+        }
+    }
+
+    /**
+     * Check if a class is a JsonResource (API Resource)
+     */
+    private function isApiResourceClass(string $className): bool
+    {
+        if (! class_exists($className)) {
+            // Check if it might be a Resource based on naming convention
+            return str_ends_with($className, 'Resource') 
+                || str_ends_with($className, 'Collection');
+        }
+
+        return is_subclass_of($className, \Illuminate\Http\Resources\Json\JsonResource::class);
+    }
+
+    /**
+     * Parse an API Resource class to extract its toArray() structure
+     */
+    private function parseApiResourceClass(string $className): ?array
+    {
+        // Check cache first
+        if (isset(self::$resourceCache[$className])) {
+            return self::$resourceCache[$className];
+        }
+
+        $result = [
+            'class' => $className,
+            'fields' => [],
+            'relations' => [],
+            'conditional_fields' => [],
+        ];
+
+        // Try to get the resource structure
+        $fields = $this->extractResourceFields($className);
+        if (! empty($fields)) {
+            $result['fields'] = $fields['fields'] ?? [];
+            $result['relations'] = $fields['relations'] ?? [];
+            $result['conditional_fields'] = $fields['conditional_fields'] ?? [];
+        }
+
+        // Cache the result
+        self::$resourceCache[$className] = $result;
+
+        return $result;
+    }
+
+    /**
+     * Extract fields from a JsonResource's toArray() method using AST parsing
+     */
+    private function extractResourceFields(string $className): array
+    {
+        $result = [
+            'fields' => [],
+            'relations' => [],
+            'conditional_fields' => [],
+        ];
+
+        if (! class_exists($className)) {
+            return $result;
+        }
+
+        try {
+            $reflection = new ReflectionClass($className);
+            $filePath = $reflection->getFileName();
+
+            if (! $filePath || ! file_exists($filePath)) {
+                return $result;
+            }
+
+            $code = file_get_contents($filePath);
+            $parser = (new ParserFactory)->createForHostVersion();
+            $ast = $parser->parse($code);
+
+            if (! $ast) {
+                return $result;
+            }
+
+            $nodeFinder = new NodeFinder;
+
+            // Find the toArray method
+            $toArrayMethod = $nodeFinder->findFirst($ast, function (Node $node) {
+                return $node instanceof Stmt\ClassMethod 
+                    && $node->name->toString() === 'toArray';
+            });
+
+            if (! $toArrayMethod) {
+                return $result;
+            }
+
+            // Find the return statement in toArray
+            /** @var Stmt\Return_|null $returnStmt */
+            $returnStmt = $nodeFinder->findFirst([$toArrayMethod], function (Node $node) {
+                return $node instanceof Stmt\Return_;
+            });
+
+            if (! $returnStmt instanceof Stmt\Return_ || ! $returnStmt->expr instanceof Expr\Array_) {
+                return $result;
+            }
+
+            // Parse the returned array
+            $this->parseResourceArrayNode($returnStmt->expr, $result);
+
+            return $result;
+
+        } catch (\Exception $e) {
+            return $result;
+        }
+    }
+
+    /**
+     * Parse the array node from a Resource's toArray() method
+     */
+    private function parseResourceArrayNode(Expr\Array_ $array, array &$result): void
+    {
+        foreach ($array->items as $item) {
+            if (! $item instanceof Expr\ArrayItem || ! $item->key) {
+                continue;
+            }
+
+            $key = $item->key instanceof Node\Scalar\String_ ? $item->key->value : null;
+            if (! $key) {
+                continue;
+            }
+
+            // Check if this is a conditional field (when, whenLoaded, etc.)
+            $itemValue = $item->value;
+            if ($itemValue instanceof Expr\MethodCall) {
+                $methodName = $itemValue->name instanceof Node\Identifier 
+                    ? $itemValue->name->toString() 
+                    : null;
+
+                if (in_array($methodName, ['when', 'whenLoaded', 'whenPivotLoaded', 'whenNotNull'])) {
+                    if ($methodName === 'whenLoaded') {
+                        // This is a relation
+                        $result['relations'][$key] = [
+                            'name' => $key,
+                            'conditional' => true,
+                            'type' => 'whenLoaded',
+                        ];
+                    } else {
+                        $result['conditional_fields'][$key] = [
+                            'name' => $key,
+                            'condition' => $methodName,
+                        ];
+                    }
+                    continue;
+                }
+            }
+
+            // Check for nested resource
+            if ($itemValue instanceof Expr\New_) {
+                $nestedClass = $itemValue->class instanceof Node\Name 
+                    ? $itemValue->class->toString() 
+                    : null;
+
+                if ($nestedClass && $this->isApiResourceClass($nestedClass)) {
+                    $result['relations'][$key] = [
+                        'name' => $key,
+                        'resource' => $nestedClass,
+                        'conditional' => false,
+                    ];
+                    continue;
+                }
+            }
+
+            // Check for static collection call
+            if ($itemValue instanceof Expr\StaticCall) {
+                $nestedClass = $itemValue->class instanceof Node\Name 
+                    ? $itemValue->class->toString() 
+                    : null;
+                $staticMethod = $itemValue->name instanceof Node\Identifier 
+                    ? $itemValue->name->toString() 
+                    : null;
+
+                if ($nestedClass && $staticMethod === 'collection' && $this->isApiResourceClass($nestedClass)) {
+                    $result['relations'][$key] = [
+                        'name' => $key,
+                        'resource' => $nestedClass,
+                        'is_collection' => true,
+                        'conditional' => false,
+                    ];
+                    continue;
+                }
+            }
+
+            // Regular field - extract the type if possible
+            $fieldType = $this->inferFieldTypeFromValue($itemValue);
+            $result['fields'][$key] = [
+                'name' => $key,
+                'type' => $fieldType,
+            ];
+        }
+    }
+
+    /**
+     * Infer the type of a field from its value expression
+     */
+    private function inferFieldTypeFromValue(Expr $value): string
+    {
+        if ($value instanceof Node\Scalar\String_) {
+            return 'string';
+        }
+
+        if ($value instanceof Node\Scalar\Int_ || $value instanceof Node\Scalar\LNumber) {
+            return 'integer';
+        }
+
+        if ($value instanceof Node\Scalar\DNumber) {
+            return 'float';
+        }
+
+        if ($value instanceof Expr\ConstFetch) {
+            $name = strtolower($value->name->toString());
+            if (in_array($name, ['true', 'false'])) {
+                return 'boolean';
+            }
+            if ($name === 'null') {
+                return 'null';
+            }
+        }
+
+        if ($value instanceof Expr\Array_) {
+            return 'array';
+        }
+
+        // $this->id, $this->name patterns
+        if ($value instanceof Expr\PropertyFetch) {
+            $property = $value->name instanceof Node\Identifier ? $value->name->toString() : '';
+            return $this->inferTypeFromPropertyName($property);
+        }
+
+        return 'mixed';
+    }
+
+    /**
+     * Infer type from property name patterns
+     */
+    private function inferTypeFromPropertyName(string $name): string
+    {
+        $nameLower = strtolower($name);
+
+        if ($name === 'id' || str_ends_with($nameLower, '_id')) {
+            return 'integer';
+        }
+
+        if (str_contains($nameLower, 'at') || str_contains($nameLower, 'date')) {
+            return 'datetime';
+        }
+
+        if (str_starts_with($nameLower, 'is_') || str_starts_with($nameLower, 'has_')) {
+            return 'boolean';
+        }
+
+        if (str_contains($nameLower, 'price') || str_contains($nameLower, 'amount') || str_contains($nameLower, 'total')) {
+            return 'float';
+        }
+
+        if (str_contains($nameLower, 'count') || str_contains($nameLower, 'quantity')) {
+            return 'integer';
+        }
+
+        return 'mixed';
+    }
+
+    /**
+     * Get parsed API resources from the method
+     */
+    public function getApiResources(): array
+    {
+        return $this->operations['api_resources'] ?? [];
+    }
+
+    /**
+     * Clear the resource cache (useful for testing)
+     */
+    public static function clearResourceCache(): void
+    {
+        self::$resourceCache = [];
     }
 
     private function analyzeMethodCall(Expr\MethodCall $call): void
@@ -217,10 +542,11 @@ class MethodBodyVisitor extends NodeVisitorAbstract
                 $printer = new \PhpParser\PrettyPrinter\Standard;
                 foreach ($value->items as $r) {
                     if ($r instanceof Node\Expr\ArrayItem) {
-                        if ($r->value instanceof Node\Scalar\String_) {
-                            $rules[] = $r->value->value;
+                        $ruleValue = $r->value;
+                        if ($ruleValue instanceof Node\Scalar\String_) {
+                            $rules[] = $ruleValue->value;
                         } else {
-                            $rules[] = $printer->prettyPrintExpr($r->value);
+                            $rules[] = $printer->prettyPrintExpr($ruleValue);
                         }
                     }
                 }
@@ -454,16 +780,20 @@ class MethodBodyVisitor extends NodeVisitorAbstract
         }
     }
 
-    private function analyzeThrow(Stmt\Throw_ $throw): void
+    /**
+     * Analyze throw expressions (PHP 8+ compatible)
+     */
+    private function analyzeThrowExpression(Expr\Throw_ $throw): void
     {
-        if ($throw->expr instanceof Expr\New_) {
-            $exceptionClass = $throw->expr->class instanceof Node\Name
-                ? $throw->expr->class->toString()
+        $throwExpr = $throw->expr;
+        if ($throwExpr instanceof Expr\New_) {
+            $exceptionClass = $throwExpr->class instanceof Node\Name
+                ? $throwExpr->class->toString()
                 : 'UnknownException';
 
             $this->operations['exceptions'][] = [
                 'exception' => $exceptionClass,
-                'arguments' => $this->extractArguments($throw->expr->args),
+                'arguments' => $this->extractArguments($throwExpr->args),
             ];
         }
     }
