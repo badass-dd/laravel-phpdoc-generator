@@ -83,11 +83,11 @@ class ScribeGenerator
      */
     private function extractFromPhpDoc(string $doc): void
     {
-        // Extract title and description (first non-tag lines after /**)
+        // Extract title and description
+        // Title is the first non-empty, non-tag line (can appear anywhere)
+        // In Scribe, title can be at the start OR after @group
         $lines = explode("\n", $doc);
-        $title = null;
-        $description = [];
-        $inDescription = false;
+        $nonTagLines = [];
         
         foreach ($lines as $line) {
             $trimmed = trim($line);
@@ -98,29 +98,26 @@ class ScribeGenerator
                 continue;
             }
             
-            // Stop at first tag
+            // Skip tags
             if (str_starts_with($trimmed, '@')) {
-                break;
-            }
-            
-            // Skip empty lines at the beginning
-            if ($title === null && $trimmed === '') {
                 continue;
             }
             
-            if ($title === null) {
-                $title = $trimmed;
-                $inDescription = true;
-            } elseif ($inDescription && $trimmed !== '') {
-                $description[] = $trimmed;
+            // Skip empty lines
+            if ($trimmed === '') {
+                continue;
             }
+            
+            // This is a non-tag, non-empty line - it's title or description text
+            $nonTagLines[] = $trimmed;
         }
         
-        if ($title) {
-            $this->documentedMetadata['title'] = $title;
-        }
-        if (! empty($description)) {
-            $this->documentedMetadata['description'] = implode(' ', $description);
+        // First non-tag line is title, rest is description
+        if (! empty($nonTagLines)) {
+            $this->documentedMetadata['title'] = array_shift($nonTagLines);
+            if (! empty($nonTagLines)) {
+                $this->documentedMetadata['description'] = implode(' ', $nonTagLines);
+            }
         }
 
         // Extract @group
