@@ -198,29 +198,8 @@ class ScribeGenerator
             }
         }
 
-        // Extract @response tags with status codes AND their content
-        // Match @response followed by status code and optionally type and JSON content
-        if (preg_match_all('/@response\s+(\d+)\s*(\w+)?\s*([\s\S]*?)(?=@\w|$)/m', $doc, $matches, PREG_SET_ORDER)) {
-            foreach ($matches as $match) {
-                $status = (int) $match[1];
-                $type = ! empty($match[2]) ? trim($match[2]) : null;
-                $content = ! empty($match[3]) ? trim($match[3]) : null;
-                
-                // Clean up the content (remove leading * from multi-line)
-                if ($content) {
-                    $content = preg_replace('/^\s*\*\s?/m', '', $content);
-                    $content = trim($content);
-                }
-                
-                $this->documentedMetadata['responses'][$status] = [
-                    'status' => $status,
-                    'type' => $type,
-                    'content' => $content,
-                    'source' => 'phpdoc',
-                    'raw' => $match[0],
-                ];
-            }
-        }
+        // Extract @response tags with full JSON content using line-by-line parsing
+        $this->extractResponseTags($doc);
 
         // Extract @header tags
         if (preg_match_all('/@header\s+(\S+)/', $doc, $matches)) {
@@ -231,6 +210,94 @@ class ScribeGenerator
                 ];
             }
         }
+    }
+
+    /**
+     * Extract @response tags with their full JSON content
+     * Handles multi-line JSON properly
+     */
+    private function extractResponseTags(string $doc): void
+    {
+        $lines = explode("\n", $doc);
+        $currentResponse = null;
+        $jsonLines = [];
+        $braceCount = 0;
+        $bracketCount = 0;
+        
+        foreach ($lines as $line) {
+            $trimmed = trim($line);
+            $trimmed = preg_replace('/^\s*\*\s?/', '', $trimmed);
+            
+            // Check for new @response tag
+            if (preg_match('/^@response\s+(\d+)\s*(\w+)?(.*)$/', $trimmed, $match)) {
+                // Save previous response if exists
+                if ($currentResponse !== null) {
+                    $this->saveExtractedResponse($currentResponse, $jsonLines);
+                }
+                
+                // Start new response
+                $status = (int) $match[1];
+                $type = ! empty($match[2]) ? trim($match[2]) : null;
+                $rest = isset($match[3]) ? trim($match[3]) : '';
+                
+                $currentResponse = [
+                    'status' => $status,
+                    'type' => $type,
+                ];
+                $jsonLines = [];
+                $braceCount = 0;
+                $bracketCount = 0;
+                
+                // Check if JSON starts on the same line
+                if ($rest !== '') {
+                    $braceCount += substr_count($rest, '{') - substr_count($rest, '}');
+                    $bracketCount += substr_count($rest, '[') - substr_count($rest, ']');
+                    $jsonLines[] = $rest;
+                }
+                continue;
+            }
+            
+            // Check for other tags (end of current response)
+            if (str_starts_with($trimmed, '@') && $currentResponse !== null) {
+                $this->saveExtractedResponse($currentResponse, $jsonLines);
+                $currentResponse = null;
+                $jsonLines = [];
+                continue;
+            }
+            
+            // Skip doc boundaries
+            if (str_starts_with($trimmed, '/**') || str_starts_with($trimmed, '*/') || $trimmed === '/') {
+                continue;
+            }
+            
+            // Accumulate JSON content for current response
+            if ($currentResponse !== null && $trimmed !== '') {
+                $braceCount += substr_count($trimmed, '{') - substr_count($trimmed, '}');
+                $bracketCount += substr_count($trimmed, '[') - substr_count($trimmed, ']');
+                $jsonLines[] = $trimmed;
+            }
+        }
+        
+        // Save last response
+        if ($currentResponse !== null) {
+            $this->saveExtractedResponse($currentResponse, $jsonLines);
+        }
+    }
+    
+    /**
+     * Save an extracted response to the metadata map
+     */
+    private function saveExtractedResponse(array $response, array $jsonLines): void
+    {
+        $status = $response['status'];
+        $content = ! empty($jsonLines) ? implode("\n", $jsonLines) : null;
+        
+        $this->documentedMetadata['responses'][$status] = [
+            'status' => $status,
+            'type' => $response['type'],
+            'content' => $content,
+            'source' => 'phpdoc',
+        ];
     }
 
     /**
